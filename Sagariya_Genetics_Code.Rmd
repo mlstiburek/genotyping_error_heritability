@@ -1,0 +1,556 @@
+#YAML
+---
+title: "Supplementary materials: simulation code - Impact of erroneous marker data on the accuracy of narrow-sense heritability"
+
+author: "Christi Sagariya, Vaclav Bittner, Torsten Pook, Amit Roy and Milan Lstiburek"
+
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Part I: Population simulation and estimation of narrow-sense heritability using error-free genotype data.
+
+```{r example, eval = FALSE}
+rm(list = ls())
+
+set.seed(1234)
+
+# Install and Load necessary libraries
+library(MoBPS)
+library(miraculix)
+library(RandomFieldsUtils)
+library(MoBPSmaps)
+library(ASRgenomics)
+library(Matrix)
+library(rrBLUP)
+
+
+# Set all input parameters
+snp_values <- c(2800, 5300, 20300) #(Both SNP and QTLs).
+ch.nr = 4 # Number of chromosome
+add <- 300 # Number of QTLs purely additive
+addv <- 0.6 # Additive QTL variance
+heri_values <- c(0.2, 0.6)  # We apply 0.2 and 0.6 true h^2 values.
+NF = 5000 # Number of founder individuals
+NP = 100 # Number of parents
+NR = 1000 # Number of offspring
+n = 100 # Number of replication
+ld = 100 # Number of random mating for LD
+SNP_density <- (snp_values - add) / (ch.nr * 100)
+
+# create directory to save output files
+if (!dir.exists("Data_vc")){
+    dir.create(paste(getwd(), "/Data_vc",sep="")) # Folder for variance components
+}else{
+    print("dir exists")
+}
+
+if (!dir.exists("Data_all")){
+    dir.create(paste(getwd(), "/Data_all",sep="")) # Folder for all genotype data
+}else{
+    print("dir exists")
+}
+
+# Start population simulation
+for (heri in heri_values) {
+    for (snp in snp_values) {
+        # Generate a SNP data set and LD build-up by random mating of 100 generation
+        dataset <- founder.simulation(nsnp = snp,
+                                      nindi = NF,
+                                      n.gen = ld,
+                                      sex.quota = 1,
+                                      sex.s = "random",
+                                      chr.nr = ch.nr,
+                                      chromosome.length = 1,
+                                      dataset = "random",
+                                      freq = "beta", #
+                                      snps.equidistant = T,
+                                      miraculix = T,
+                                      miraculix.dataset = T,
+                                      verbose = F,
+                                      plot = F,
+                                      big.output = F)
+        
+        RFoptions(helpinfo=FALSE)
+        for (i in 1:n) {
+            # input the SNP data set for founder population simulation
+            population <- creating.diploid(nindi = NF,
+                                           dataset = dataset,
+                                           chromosome.length = 1,
+                                           chr.nr = 4,
+                                           sex.quota = 1,
+                                           verbose = F)
+            
+            # exclude QTLs on SNP array
+            array_marker <- sort(sample(1:snp, (snp-add))) # all snp markers placed on array
+            array_mobps <- rep(FALSE,snp)
+            array_mobps[array_marker] <- TRUE
+            
+            # create a trait using specified genetic architecture
+            population <- creating.trait(population,
+                                         exclude.snps = array_marker,
+                                         n.additive = add,
+                                         var.additive.l = addv,
+                                         mean.target = 0,
+                                         var.target = 1,
+                                         trait.name = "Trait1",
+                                         verbose = F)
+            
+            # add SNP array
+            population <- add.array(population, marker.included = array_mobps)
+            
+            population <- breeding.diploid(population  = population,
+                                           genotyped.array = 2,
+                                           genotyped.gen = 1,
+                                           remove.effect.position = TRUE)
+            
+            # input heritability value
+            population <- breeding.diploid(population,
+                                           phenotyping.gen = 1,
+                                           heritability = heri)
+            
+            # randomly sampling of parents
+            population <- breeding.diploid(population,
+                                           selection.size = c(0,NP),
+                                           copy.individual.f = T,
+                                           selection.f = "random")
+            # generate offspring individuals
+            population <- breeding.diploid(population,
+                                           breeding.size = NR,
+                                           breeding.sex = 1,
+                                           selection.f.gen = 2,
+                                           name.cohort = "nr")
+            
+            # specify phenotyping generation
+            population <- breeding.diploid(population,
+                                           genotyped.array = 2,
+                                           phenotyping.gen = 3,
+                                           genotyped.gen = 3)
+            
+            # extract pedigree, phenotypes, true breeding value data of offspring
+            df_one <- cbind.data.frame(get.pedigree(population, gen = 3),
+                                       t(get.pheno(population, gen = 3)),
+                                       t(get.bv(population, gen = 3)))
+            colnames(df_one)[c(4,5)] <- paste0(colnames(df_one)[c(4,5)],c("_PV","_BV"))
+            df_one$family <- paste0(df_one$mother,"X",df_one$father)
+            
+            # extract MoBPS estimated breeding values
+            bve <- as.data.frame(t(get.bve(population, gen = 3)))
+            bve$i <- i
+            bve$method <- "mobps.bve"
+            
+            # extract pedigree
+            pedi <- as.data.frame(get.pedigree(population, gen = 3))
+            pedi$offspring <- as.factor(pedi$offspring)
+            pedi$father <- as.factor(pedi$father)
+            pedi$mother <- as.factor(pedi$mother)
+            
+            # extract phenotypes
+            pheno <- as.data.frame(t(get.pheno(population, gen = 3)))
+            pheno$ID <- paste0(row.names(pheno))
+            pheno <- pheno[,c(2,1)]
+            
+            # MODEL 1: h^2 estimation using G matrix prior to any error introduction
+            # extract genotype data
+            geno1_list <- get.geno(population, gen = 3, array = 2)
+            
+            # quality filtering
+            geno1_f <- qc.filtering(M = t(geno1), maf = 0.05, marker.callrate = 0.2,
+                                    ind.callrate = 0.20, impute = FALSE, plots = TRUE,
+                                    message = F)
+            geno1_f <- geno1_f$M.clean
+            
+            # calculate genomic relationship matrix by VanRaden 2008
+            GRM1 <- miraculix::relationshipMatrix(miraculix::genomicmatrix(t(geno1_f)))
+            row.names(GRM1) <- paste0(pheno$ID)
+            colnames(GRM1) <- paste0(pheno$ID)
+            
+            # perform REML to estimate variance components
+            model1 <- mixed.solve(y=pheno$Trait1, K = GRM1, method = "REML", SE = TRUE)
+            
+            # extract variance components from model1
+            vc_model1 <- cbind.data.frame(model1$Vu, model1$Ve)
+            colnames(vc_model1) <- c("Va", "Ve")
+            vc_model1$type <- "Estimate"
+            vc_model1$i <- i
+            vc_model1$model <- "M_S0_G"
+            row.names(vc_model1) <- "vc"
+            
+            # extract BLUP values
+            blup_model1 <- as.data.frame(model1$u)
+            colnames(blup_model1)[1] <- "BLUP"
+            blup_model1$bve <- bve[["Trait1"]]
+            blup_model1$tbv <- df_one[["Trait1_BV"]]
+            blup_model1$i <- i
+            
+            # estimate Spearman's rank correlation coefficient between TBV and EBV (BLUPs)
+            blup_model1$rank.tbv <- rank(blup_model1$tbv)
+            blup_model1$rank.blup <- rank(blup_model1$BLUP)
+            SRC1_model_1 <- cor.test(blup_model1$rank.tbv, blup_model1$rank.blup,
+                                     method = "spearman")
+            SRC1_model_1 <- as.data.frame(SRC1_model_1[["estimate"]][["rho"]])
+            colnames(SRC1_model_1) <- "SRC1"
+            SRC1_model_1$type <- "Estimate"
+            SRC1_model_1$i <- i
+            SRC1_model_1$model <- "SRC_M_S0_G"
+            row.names(SRC1_model_1) <- "SRC1"
+            
+            # calculate narrow-sense heritability using variance components
+            h2_model1 <- (model1$Vu / (model1$Vu + model1$Ve))
+            h2_model1 <- as.data.frame(h2_model1)
+            colnames(h2_model1) <- "h2"
+            h2_model1$type <- "Estimate"
+            h2_model1$i <- i
+            h2_model1$model <- "M_S0_G"
+            row.names(h2_model1) <- "h2"
+            
+            # save variances
+            vc <- data.frame(vc_model1)
+            
+            # save heritability
+            h2 <- data.frame(h2_model1)
+            h2$snp_density <- SNP_density[which(snp_values == snp)]
+            
+            # save Spearman's rank correlation coefficient
+            SRC <- data.frame(SRC1_model_1)
+            SRC$snp_density <- SNP_density[which(snp_values == snp)]
+            
+            Heritability <- h2
+            
+            # Save data sets in CSV files within the iteration loop
+            write.csv(x = df_one, file = paste(getwd(),"/Data_all/","df_one_",heri,"_",snp,"_",i,".csv", 
+                                               sep = ""),row.names = T,quote = F)
+            write.csv(x = geno1_list, file = paste(getwd(),"/Data_all/","Geno1_",heri,"_",snp,"_",i,".csv",
+                                                   sep = ""),row.names = T,quote = F)
+            write.csv(x = Heritability, file = paste(getwd(),"/Data_vc/","S0_Heritability_",heri,"_",snp,"_",
+                                                     i,".csv",sep = ""),row.names = T, quote = F)
+            write.csv(x = SRC, file = paste(getwd(),"/Data_vc/","S0_Spearman_rank_corr_",heri,"_",snp,"_",
+                                            i,".csv", sep = ""),row.names = T,quote = F)
+            
+            print(paste("Completed iteration:", i, "for heritability:", heri, "and snp:", snp))
+        }
+    }
+}
+
+```
+
+## Part II: Error introuduction. Scenario 1: Directional genotype perturbation
+
+```{r verb, eval = FALSE, echo=TRUE}
+# Define path of simulated genotype and phenotype data-sets
+path <- "D:/LB_05_GRM_5_50snp_0.6h2/Data_all"
+
+# List all genotype and phenotype files, ensuring they are sorted identically.
+geno_files <- sort(list.files(path = path, pattern = "Geno1b_.*csv$", full.names = TRUE))
+df_one_files <- sort(list.files(path = path, pattern = "df_one.*csv$", full.names = TRUE))
+
+# create list of data frames
+h2_list <- list()
+blup_list <- list()
+SRC_list <- list()
+
+# error rate
+e_1 <- c(0.02, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0)
+
+for (i in seq_along(geno_files)) {
+    # read genotype and phenotype data
+    geno_original <- as.matrix(read.csv(file = geno_files[i], header = TRUE, row.names = 1))
+    df_one <- read.csv(file = df_one_files[i], header = TRUE)
+
+    # introduce genotype error
+    for (k in seq_along(e_1)) {
+        geno1b <- geno_original
+        
+        # This function modifies a single genotype value based on the given rules.
+        modify_genotype <- function(genotype) {
+            if (genotype == 0) {
+                return(sample(c(1, 2), 1, prob = c(2/3, 1/3)))
+            } else if (genotype == 1) {
+                return(sample(c(0, 1, 2), 1, prob = c(1/3, 1/3, 1/3)))
+            } else {
+                return(sample(c(0, 1), 1, prob = c(1/3, 2/3)))
+            }
+        }
+        
+        total_cells <- nrow(geno1b) * ncol(geno1b)
+        cells_to_modify <- round(e_1[k] * total_cells)
+        
+        # get row and column indices of cells to modify
+        random_indices <- sample(1:total_cells, cells_to_modify, replace = FALSE)
+        row_indices <- ((random_indices - 1) %% nrow(geno1b)) + 1
+        col_indices <- ((random_indices - 1) %/% nrow(geno1b)) + 1
+        
+        
+        # modify the genotypes
+        for (j in seq_len(cells_to_modify)) {
+            geno1b[row_indices[j], col_indices[j]] <- modify_genotype(geno1b[row_indices[j], col_indices[j]])
+        }
+        
+        # quality filtering
+        geno1b_f <- qc.filtering(M = t(geno1b), maf = 0.05, marker.callrate = 0.2,
+                                 ind.callrate = 0.20, impute = FALSE, plots = TRUE,
+                                 message = FALSE)
+        geno1b_f <- geno1b_f$M.clean
+        
+        # calculate genomic relationship matrix by VanRaden 2008
+          GRM1b <- miraculix::relationshipMatrix(miraculix::genomicmatrix(t(geno1b_f)))
+          row.names(GRM1b) <- paste0(df_one$offspring)
+          colnames(GRM1b) <- paste0(df_one$offspring)
+        # perform REML to estimate variance components
+         model1b <- mixed.solve(y = df_one$Trait1_PV,
+                                K = GRM1b,
+                                method = "REML",
+                                SE = TRUE)
+        
+        # extract variance components from model1
+         vc_model1b <- cbind.data.frame(Vu = model1b$Vu, Ve = model1b$Ve)
+         h2_value <- vc_model1b$Vu / (vc_model1b$Vu + vc_model1b$Ve)
+        
+        # save heritability
+        h2_df <- data.frame(h2 = h2_value,
+                             file = basename(geno_files[i]),
+                             type = "Estimate",
+                             model = "M_S1_G",
+                             error = e_1[k])
+        
+        # extract BLUP values
+         blup <- as.data.frame(model1b$u)
+         colnames(blup)[1] <- "BLUP"
+         blup$tbv <- df_one$Trait1_BV
+         blup$model <- "SRC_M_S1_G"
+         blup$file <- basename(geno_files[i])
+         blup$error <- e_1[k]
+        
+         # estimate Spearman's rank correlation coefficient between TBV and EBV (BLUPs)
+         
+         blup$rank.tbv <- rank(blup$tbv, ties.method = "average", na.last = TRUE)
+         blup$rank.blup <- rank(blup$BLUP, ties.method = "average", na.last = TRUE)
+         SRC <- cor.test(blup$rank.tbv, blup$rank.blup, method = "spearman")
+        
+         # save Spearman's rank correlation coefficient
+         SRC_df <- data.frame(SRC = SRC$estimate,
+                              type = "Estimate",
+                              model = "SRC_M_S1_G",
+                              file = basename(geno_files[i]),
+                              error = e_1[k])
+        
+         h2_list[[length(h2_list) + 1]] <- h2_df
+         blup_list[[length(blup_list) + 1]] <- blup
+         SRC_list[[length(SRC_list) + 1]] <- SRC_df
+        
+    }
+    
+}
+
+# save all data sets in CSV files
+h2_results <- do.call(rbind, h2_list)
+blup_results <- do.call(rbind, blup_list)
+SRC_results <- do.call(rbind, SRC_list)
+
+```
+
+## Part II: Error introuduction. Scenario 2: Hardy-Weinberg redraw
+
+```{r example2, eval = FALSE, echo=TRUE}
+# Define path of simulated genotype and phenotype data-sets
+path <- "D:/CS_GRM1/Data_all"
+
+# List all genotype and phenotype files, ensuring they are sorted identically.
+geno_files <- list.files(path = path, pattern = "Geno1_.*csv$", full.names = TRUE)
+df_one_files <- list.files(path = path, pattern = "df_one_.*csv$", full.names = TRUE)
+
+# create list of data frames
+h2_list <- list()
+blup_list <- list()
+SRC_list <- list()
+
+# error rate
+e_1 <- c(0.02, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0)
+
+for (i in seq_along(geno_files)) {
+    # read genotype and phenotype data
+    geno_original <- as.matrix(read.csv(file = geno_files[i], header = TRUE, row.names = 1))
+    df_one <- read.csv(file = df_one_files[i], header = TRUE)
+    
+    # calculate allel frequency to fix H-W redraw in the error introduction 
+    u <- rowMeans(geno_original) / 2
+    p0 <- (1 - u)^2
+    p1 <- 2 * u * (1 - u)
+    p2 <- u^2
+    
+    # introduce genotype error
+    for (k in seq_along(e_1)) {
+        geno <- geno_original
+        total_elements <- length(geno)
+        num_modify <- round(e_1[k] * total_elements)
+        modify_indices <- sample(1:total_elements, num_modify)
+        
+        # genotype modification based on H-W redraw
+        geno_flat <- as.vector(geno)
+        for (j in modify_indices) {
+            snp <- (j - 1) %% nrow(geno) + 1
+            geno_flat[j] <- sample(0:2, size = 1, prob = c(p0[snp], p1[snp], p2[snp]))
+        }
+        
+        geno <- matrix(geno_flat, nrow = nrow(geno), ncol = ncol(geno), byrow = FALSE)
+        rownames(geno) <- rownames(geno_original)
+        colnames(geno) <- colnames(geno_original)
+        
+        # quality filtering 
+        geno_filtered <- qc.filtering(M = t(geno), maf = 0.05, marker.callrate = 0.2,
+                                      ind.callrate = 0.20, impute = FALSE, plots = TRUE,
+                                      message = FALSE)
+        geno_b <- geno_filtered$M.clean
+        
+        # calculate genomic relationship matrix by VanRaden 2008
+        GRM <- miraculix::relationshipMatrix(miraculix::genomicmatrix(t(geno_b)))
+        row.names(GRM) <- paste0(df_one$offspring)
+        colnames(GRM) <- paste0(df_one$offspring)
+        
+        # perform REML to estimate variance components
+        model <- mixed.solve(y = df_one$Trait1_PV, 
+                             K = GRM, 
+                             method = "REML", 
+                             SE = TRUE)
+        
+        # extract variance components from model
+        vc_model <- cbind.data.frame(Vu = model$Vu, Ve = model$Ve)
+        h2_value <- vc_model$Vu / (vc_model$Vu + vc_model$Ve)
+        
+        # save heritability
+        h2_df <- data.frame(h2 = h2_value,
+                            file = basename(geno_files[i]),
+                            type = "Estimate",
+                            model = "M_S2_G",
+                            error = e_1[k])
+        
+        # extract BLUP values
+        blup <- as.data.frame(model$u)
+        colnames(blup)[1] <- "BLUP"
+        blup$tbv <- df_one$Trait1_BV
+        blup$model <- "SRC_M_S2_G"
+        blup$file <- basename(geno_files[i])
+        blup$error <- e_1[k]
+        
+        # estimate Spearman's rank correlation coefficient between TBV and EBV (BLUPs)
+        blup$rank.tbv <- rank(blup$tbv, ties.method = "average", na.last = TRUE)
+        blup$rank.blup <- rank(blup$BLUP, ties.method = "average", na.last = TRUE)
+        SRC <- cor.test(blup$rank.tbv, blup$rank.blup, method = "spearman")
+        
+        # save Spearman's rank correlation coefficient
+        SRC_df <- data.frame(SRC = SRC$estimate,
+                             type = "Estimate",
+                             model = "SRC_M_S2_G",
+                             file = basename(geno_files[i]),
+                             error = e_1[k])
+        
+        h2_list[[length(h2_list) + 1]] <- h2_df
+        blup_list[[length(blup_list) + 1]] <- blup
+        SRC_list[[length(SRC_list) + 1]] <- SRC_df
+        
+    }
+}
+
+# save all data sets in CSV files
+h2_results <- do.call(rbind, h2_list)
+blup_results <- do.call(rbind, blup_list)
+SRC_results <- do.call(rbind, SRC_list)
+
+```
+
+## Part II: Error introuduction. Scenario 3: Uniform redraw
+
+```{r example3, eval = FALSE, echo=TRUE}
+
+# Define path of simulated genotype and phenotype data-sets
+path <- "D:/CS_GRM1/Data_all"
+
+# create list of data frames
+h2_list <- list()
+blup_list <- list()
+SRC_list <- list()
+
+# List all genotype and phenotype files, ensuring they are sorted identically.
+geno_files <- list.files(path = path, pattern = "Geno1_.*csv$", full.names = TRUE)
+df_one_files <- list.files(path = path, pattern = "df_one_.*csv$", full.names = TRUE)
+
+# error rate
+e_1 <- c(0.02, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0)
+
+for (i in seq_along(geno_files)) {
+    # read genotype and phenotype data
+    geno_original <- as.matrix(read.csv(file = geno_files[i], header = TRUE, row.names = 1))
+    df_one <- read.csv(file = df_one_files[i], header = TRUE)
+    
+    for (k in seq_along(e_1)) {
+        # introduce genotype error
+        total_elements <- length(geno)
+        num_modify <- round(e_1[k] * total_elements)
+        
+        modify_indices <- sample(1:total_elements, num_modify, replace = FALSE)
+        replacement_values <- sample(0:2, num_modify, replace = TRUE, prob = c(1/3, 1/3, 1/3))
+        geno[modify_indices] <- replacement_values
+        
+        geno_filtered <- qc.filtering(M = t(geno), maf = 0.05, marker.callrate = 0.2,
+                                      ind.callrate = 0.20, impute = FALSE, plots = TRUE,
+                                      message = FALSE)
+        geno_b <- geno_filtered$M.clean
+        
+        # calculate genomic relationship matrix by VanRaden 2008
+        GRM1b <- miraculix::relationshipMatrix(miraculix::genomicmatrix(t(geno_b)))
+        dimnames(GRM1b) <- list(rownames(geno_b), rownames(geno_b))
+        
+        # perform REML to estimate variance components
+        model <- mixed.solve(y = df_one$Trait1_PV, 
+                             K = GRM1b, 
+                             method = "REML", 
+                             SE = TRUE)
+        
+        # extract variance components from model 
+        vc_model <- cbind.data.frame(Vu = model$Vu, Ve = model$Ve)
+        h2_value <- vc_model$Vu / (vc_model$Vu + vc_model$Ve)
+        h2_df <- data.frame(h2 = h2_value,
+                            file = basename(geno_files[i]),
+                            type = "Estimate",
+                            model = "M_S3_G", 
+                            error = e_1[k])
+       
+        # extract BLUP values
+        blup <- as.data.frame(model$u)
+        colnames(blup)[1] <- "BLUP"
+        blup$tbv <- df_one$Trait1_BV
+        blup$model <- "BLUP_M_S3_G"
+        blup$file <- basename(geno_files[i])
+        blup$error <- e_1[k]
+        
+        # estimate Spearman's rank correlation coefficient between TBV and EBV (BLUPs)
+        blup$rank.tbv <- rank(blup$tbv, ties.method = "average", na.last = TRUE)
+        blup$rank.blup <- rank(blup$BLUP, ties.method = "average", na.last = TRUE)
+        SRC <- cor.test(blup$rank.tbv, blup$rank.blup, method = "spearman")
+        
+        # save Spearman's rank correlation coefficient
+        SRC_df <- data.frame(SRC = SRC$estimate,
+                             type = "Estimate",
+                             model = "SRC_M_S3_G",
+                             file = basename(geno_files[i]),
+                             error = e_1[k])
+        
+        h2_list[[length(h2_list) + 1]] <- h2_df
+        blup_list[[length(blup_list) + 1]] <- blup
+        SRC_list[[length(SRC_list) + 1]] <- SRC_df
+        
+    }
+}
+
+# save all data sets in CSV files
+h2_results <- do.call(rbind, h2_list)
+blup_results <- do.call(rbind, blup_list)
+SRC_results <- do.call(rbind, SRC_list)
+
+
+```
